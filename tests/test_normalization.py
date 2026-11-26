@@ -38,69 +38,49 @@ class TestNormalization(unittest.TestCase):
         }
 
     def test_builds_normalized_record(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
-
+        results = build_normalized_records(self.ingestion_result)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["record_id"], "REC_001")
 
     def test_preserves_source_information(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
-
+        results = build_normalized_records(self.ingestion_result)
         source = results[0]["source"]
 
         self.assertEqual(source["hospital_id"], "HOSP_001")
-        self.assertEqual(
-            source["file"],
-            "registration/patients.json"
-        )
+        self.assertEqual(source["file"], "registration/patients.json")
         self.assertEqual(source["locator"], "/patients/0")
 
     def test_identifies_hospital_from_metadata(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
+        results = build_normalized_records(self.ingestion_result)
 
         self.assertEqual(
             results[0]["hospital"]["hospital_name"],
             "Jeevan Jyoti Hospital"
         )
-
         self.assertEqual(
             results[0]["hospital"]["evidence_source"],
             "json_metadata"
         )
 
     def test_extracts_patient_and_relative_names(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
-
+        results = build_normalized_records(self.ingestion_result)
         candidates = results[0]["identity_candidates"]
 
         self.assertEqual(
             candidates["patient_names"][0]["value"],
             "Aarav Sharma"
         )
-
         self.assertEqual(
             candidates["relative_names"][0]["value"],
             "Rohan Sharma"
         )
-
         self.assertEqual(
             candidates["relative_names"][0]["relation"],
             "father"
         )
 
     def test_extracts_identifiers(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
-
+        results = build_normalized_records(self.ingestion_result)
         identifiers = results[0]["identity_candidates"]["identifiers"]
 
         identifier_types = [
@@ -118,9 +98,7 @@ class TestNormalization(unittest.TestCase):
         self.assertFalse(aadhaar["verified"])
 
     def test_runs_pii_detection(self):
-        results = build_normalized_records(
-            self.ingestion_result
-        )
+        results = build_normalized_records(self.ingestion_result)
 
         categories = [
             item["category"]
@@ -149,8 +127,32 @@ class TestNormalization(unittest.TestCase):
         self.assertIsNone(
             results[0]["hospital"]["hospital_name"]
         )
-
         self.assertIsNone(results[0]["source"]["hospital_id"])
+
+    def test_conflicting_hospital_evidence_across_records_returns_unknown(self):
+        ingestion_result = {
+            **self.ingestion_result,
+            "records": [
+                self.ingestion_result["records"][0],
+                {
+                    "locator": "/fhir/organization/0",
+                    "data": {
+                        "resourceType": "Organization",
+                        "name": "Arogya Seva Sadan"
+                    }
+                }
+            ]
+        }
+
+        results = build_normalized_records(ingestion_result)
+
+        self.assertIsNone(
+            results[0]["hospital"]["hospital_name"]
+        )
+        self.assertEqual(
+            results[0]["hospital"]["confidence"],
+            "unknown"
+        )
 
     def test_failed_ingestion_returns_empty_list(self):
         ingestion_result = {
@@ -163,8 +165,32 @@ class TestNormalization(unittest.TestCase):
         }
 
         results = build_normalized_records(ingestion_result)
-
         self.assertEqual(results, [])
+
+    def test_detects_pii_in_document_metadata(self):
+        ingestion_result = {
+            **self.ingestion_result,
+            "metadata": {
+                **self.ingestion_result["metadata"],
+                "document_metadata": {
+                    "_export_meta": {
+                        "hospital": "Jeevan Jyoti Hospital",
+                        "contact_phone": "9123456780"
+                    }
+                }
+            }
+        }
+
+        results = build_normalized_records(ingestion_result)
+
+        metadata_phone_detections = [
+            detection
+            for detection in results[0]["detections"]
+            if detection["category"] == "PHONE"
+            and "metadata.document_metadata" in detection["path"]
+        ]
+
+        self.assertTrue(metadata_phone_detections)
 
 
 if __name__ == "__main__":
