@@ -75,11 +75,11 @@ RELATIVE_LABELS = re.compile(
     r"C/O|S/O|D/O|W/O|F/O|"
     r"relative\s+name|guardian\s+name|"
     r"father\s+name|mother\s+name|"
-    r"पिता(?:\s+का\s+नाम)?|"
-    r"माता(?:\s+का\s+नाम)?|"
-    r"पति(?:\s+का\s+नाम)?|"
-    r"पत्नी(?:\s+का\s+नाम)?|"
-    r"अभिभावक(?:\s+का\s+नाम)?"
+    r"à¤ªà¤¿à¤¤à¤¾(?:\s+à¤•à¤¾\s+à¤¨à¤¾à¤®)?|"
+    r"à¤®à¤¾à¤¤à¤¾(?:\s+à¤•à¤¾\s+à¤¨à¤¾à¤®)?|"
+    r"à¤ªà¤¤à¤¿(?:\s+à¤•à¤¾\s+à¤¨à¤¾à¤®)?|"
+    r"à¤ªà¤¤à¥à¤¨à¥€(?:\s+à¤•à¤¾\s+à¤¨à¤¾à¤®)?|"
+    r"à¤…à¤à¤¿à¤à¤¾à¤µà¤•(?:\s+à¤•à¤¾\s+à¤¨à¤¾à¤®)?"
     r")"
     r"\s*[:\-]?\s*([^\n,;]{2,60})",
     re.IGNORECASE
@@ -88,7 +88,7 @@ RELATIVE_LABELS = re.compile(
 PATIENT_LABELS = re.compile(
     r"(?:"
     r"patient\s+name|patient|"
-    r"नाम|रोगी\s+का\s+नाम|मरीज\s+का\s+नाम"
+    r"à¤¨à¤¾à¤®|à¤°à¥‹à¤—à¥€\s+à¤•à¤¾\s+à¤¨à¤¾à¤®|à¤®à¤°à¥€à¤œ\s+à¤•à¤¾\s+à¤¨à¤¾à¤®"
     r")"
     r"\s*[:\-]\s*([^\n,;]{2,60})",
     re.IGNORECASE
@@ -98,11 +98,11 @@ MEDICAL_WORDS = {
     "fever", "cough", "cold", "pain", "vomiting",
     "diabetes", "hypertension", "dengue", "malaria",
     "headache", "weakness", "breathlessness",
-    "बुखार", "खांसी", "खाँसी", "दर्द", "उल्टी",
+    "à¤¬à¥à¤–à¤¾à¤°", "à¤–à¤¾à¤‚à¤¸à¥€", "à¤–à¤¾à¤à¤¸à¥€", "à¤¦à¤°à¥à¤¦", "à¤‰à¤²à¥à¤Ÿà¥€",
 }
 
 DOCTOR_PREFIX = re.compile(
-    r"(?:dr\.?|doctor|डॉ\.?|डॉक्टर)$",
+    r"(?:dr\.?|doctor|à¤¡à¥‰\.?|à¤¡à¥‰à¤•à¥à¤Ÿà¤°)$",
     re.IGNORECASE
 )
 
@@ -310,6 +310,30 @@ def detect_in_text(
             0.85
         )
 
+    # Detect names in WhatsApp-style "Report of ... behenji" messages.
+    for match in REPORT_OF_PATTERN.finditer(text):
+        name = match.group(1)
+        start = match.start(1)
+        end = match.end(1)
+
+        while name and name[0].isspace():
+            name = name[1:]
+            start += 1
+
+        while name and name[-1].isspace():
+            name = name[:-1]
+            end -= 1
+
+        if name:
+            add_detection(
+                "PATIENT_NAME",
+                start,
+                end,
+                "whatsapp_report_rule",
+                0.95
+            )
+
+    # Detect patient names after patient-related labels.
     for match in PATIENT_LABELS.finditer(text):
         name = match.group(1)
         start = match.start(1)
@@ -327,16 +351,6 @@ def detect_in_text(
                 "context_rule",
                 0.90
             )
-
-    for match in REPORT_OF_PATTERN.finditer(text):
-        start, end = match.span(1)
-        add_detection(
-            "PATIENT_NAME",
-            start,
-            end,
-            "whatsapp_report_rule",
-            0.95
-        )
 
     if compiled_known_names is None:
         compiled_known_names = compile_known_names(known_names)

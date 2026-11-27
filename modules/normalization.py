@@ -7,6 +7,7 @@ from modules.hospital_identification import identify_hospital
 
 
 def get_hospital_information(data, document_metadata, all_records):
+
     hospital_evidence = []
 
     hospital_input = {
@@ -63,6 +64,7 @@ def get_hospital_information(data, document_metadata, all_records):
 
 
 def build_normalized_records(ingestion_result, known_names=None):
+
     if not isinstance(ingestion_result, dict):
         return []
 
@@ -97,6 +99,7 @@ def build_normalized_records(ingestion_result, known_names=None):
     normalized_records = []
 
     for index, item in enumerate(records):
+
         if not isinstance(item, dict):
             continue
 

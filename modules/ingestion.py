@@ -12,10 +12,11 @@ SUPPORTED_FORMATS = {
     ".txt": "TXT"
 }
 
+MAX_JSON_DEPTH = 100
+
 
 def make_result(source_file, file_format, status, error_code=None,
-               records=None, metadata=None, warnings=None):
-
+                records=None, metadata=None, warnings=None):
     return {
         "source_file": source_file,
         "format": file_format,
@@ -28,57 +29,59 @@ def make_result(source_file, file_format, status, error_code=None,
 
 
 def decode_file(raw):
-
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-
         text = raw.decode("utf-16")
-
         if "\x00" in text:
             raise ValueError("binary_content")
-
         return text, "utf-16"
 
     try:
-
         text = raw.decode("utf-8-sig")
-
         if "\x00" in text:
             raise ValueError("binary_content")
-
         return text, "utf-8-sig"
-
     except UnicodeDecodeError:
         pass
 
     if b"\x00" in raw:
-
         try:
-
             text = raw.decode("utf-16")
-
             if "\x00" not in text:
                 return text, "utf-16"
-
         except UnicodeDecodeError:
             pass
-
         raise ValueError("binary_content")
 
     try:
-
         text = raw.decode("cp1252")
-
         if "\x00" in text:
             raise ValueError("binary_content")
-
         return text, "cp1252"
-
     except UnicodeDecodeError:
         raise ValueError("undecodable_text")
 
 
-def read_csv(text, delimiter):
+def validate_json_depth(data):
+    stack = [(data, 0)]
 
+    while stack:
+        current, depth = stack.pop()
+
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError("excessive_json_depth")
+
+        if isinstance(current, dict):
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+
+        elif isinstance(current, list):
+            for value in current:
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+
+
+def read_csv(text, delimiter):
     reader = csv.DictReader(
         io.StringIO(text),
         delimiter=delimiter
@@ -99,11 +102,9 @@ def read_csv(text, delimiter):
         raise ValueError("duplicate_header")
 
     reader.fieldnames = headers
-
     records = []
 
     for index, row in enumerate(reader):
-
         if None in row:
             raise ValueError("extra_columns")
 
@@ -119,21 +120,19 @@ def read_csv(text, delimiter):
 
 
 def read_json(text):
-
     try:
         data = json.loads(text)
-
     except json.JSONDecodeError as error:
         raise ValueError("invalid_json") from error
+
+    validate_json_depth(data)
 
     records = []
     warnings = []
     file_format = "JSON"
     document_metadata = {}
 
-    # FHIR Bundle
     if isinstance(data, dict) and data.get("resourceType") == "Bundle":
-
         file_format = "FHIR"
 
         document_metadata = {
@@ -148,7 +147,6 @@ def read_json(text):
             raise ValueError("invalid_fhir_entries")
 
         for index, entry in enumerate(entries):
-
             if not isinstance(entry, dict):
                 warnings.append("Invalid FHIR entry skipped")
                 continue
@@ -164,19 +162,14 @@ def read_json(text):
                 "data": resource
             })
 
-    # JSON array
     elif isinstance(data, list):
-
         for index, item in enumerate(data):
-
             records.append({
                 "locator": f"/{index}",
                 "data": item
             })
 
-    # JSON object
     elif isinstance(data, dict):
-
         collection_keys = (
             "visits",
             "patients",
@@ -187,25 +180,18 @@ def read_json(text):
         selected_key = None
 
         for key in collection_keys:
-
             if isinstance(data.get(key), list):
-
                 if selected_key is not None:
-
                     warnings.append(
                         "Multiple record collections found; "
                         "entire JSON object kept as one record"
                     )
-
                     selected_key = None
                     break
 
                 selected_key = key
 
         if selected_key is not None:
-
-            # Preserve all document-level information
-            # outside the selected record collection.
             document_metadata = {
                 key: value
                 for key, value in data.items()
@@ -213,9 +199,7 @@ def read_json(text):
             }
 
             for index, item in enumerate(data[selected_key]):
-
                 if not isinstance(item, dict):
-
                     warnings.append(
                         f"Invalid record skipped at {selected_key}/{index}"
                     )
@@ -227,15 +211,12 @@ def read_json(text):
                 })
 
         else:
-
             records.append({
                 "locator": "/",
                 "data": data
             })
 
-    # Primitive JSON value
     else:
-
         records.append({
             "locator": "/",
             "data": data
@@ -245,7 +226,6 @@ def read_json(text):
 
 
 def read_text(text):
-
     return [{
         "locator": "doc",
         "data": {"text": text}
@@ -253,16 +233,12 @@ def read_text(text):
 
 
 def ingest_file(file_path, hospital_id, input_root):
-
     path = Path(file_path)
     root = Path(input_root)
-
     file_format = SUPPORTED_FORMATS.get(path.suffix.lower())
 
     try:
-
         if path.is_symlink():
-
             return make_result(
                 path.name, file_format, "UNSAFE", "symbolic_link"
             )
@@ -271,52 +247,45 @@ def ingest_file(file_path, hospital_id, input_root):
         resolved_root = root.resolve()
 
         if not resolved_path.is_relative_to(resolved_root):
-
             return make_result(
                 path.name, file_format, "UNSAFE", "outside_input_folder"
             )
 
         if not resolved_path.is_file():
-
             return make_result(
                 path.name, file_format, "MALFORMED", "not_a_file"
             )
 
         if file_format is None:
-
             return make_result(
                 path.name, None, "UNSUPPORTED", "unsupported_format"
             )
 
-        source_file = resolved_path.relative_to(resolved_root).as_posix()
+        source_file = resolved_path.relative_to(
+            resolved_root
+        ).as_posix()
 
         raw = resolved_path.read_bytes()
 
         if not raw.strip():
-
             return make_result(
                 source_file, file_format, "MALFORMED", "empty_file"
             )
 
         text, encoding = decode_file(raw)
-
         warnings = []
         document_metadata = {}
 
         if file_format == "CSV":
-
             records = read_csv(text, ",")
 
         elif file_format == "TSV":
-
             records = read_csv(text, "\t")
 
         elif file_format == "JSON":
-
             records, file_format, warnings, document_metadata = read_json(text)
 
         else:
-
             records = read_text(text)
 
         return make_result(
@@ -334,23 +303,24 @@ def ingest_file(file_path, hospital_id, input_root):
         )
 
     except ValueError as error:
-
         error_code = str(error)
 
-        status = "UNSAFE" if error_code == "binary_content" else "MALFORMED"
+        status = (
+            "UNSAFE"
+            if error_code == "binary_content"
+            else "MALFORMED"
+        )
 
         return make_result(
             path.name, file_format, status, error_code
         )
 
     except PermissionError:
-
         return make_result(
             path.name, file_format, "UNSAFE", "read_permission_denied"
         )
 
     except (OSError, csv.Error, RecursionError):
-
         return make_result(
             path.name, file_format, "MALFORMED", "file_read_error"
         )

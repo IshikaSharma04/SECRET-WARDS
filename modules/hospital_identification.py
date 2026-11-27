@@ -1,5 +1,6 @@
 
 def identify_hospital(metadata):
+
     if not isinstance(metadata, dict):
         metadata = {}
 

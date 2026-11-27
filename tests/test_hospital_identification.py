@@ -99,6 +99,23 @@ class TestHospitalIdentification(unittest.TestCase):
         self.assertIsNone(result["hospital_name"])
         self.assertEqual(result["confidence"], "unknown")
 
+    def test_conflicting_hospital_evidence_returns_unknown(self):
+        metadata = {
+            "document_metadata": {
+                "_export_meta": {
+                    "hospital": "Sanjeevani Multispeciality Hospital"
+                }
+            },
+            "resourceType": "Organization",
+            "name": "Arogya Seva Sadan"
+        }
+
+        result = identify_hospital(metadata)
+
+        self.assertIsNone(result["hospital_name"])
+        self.assertIsNone(result["evidence_source"])
+        self.assertEqual(result["confidence"], "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()
