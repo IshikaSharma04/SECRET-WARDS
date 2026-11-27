@@ -596,17 +596,6 @@ Track 3 · Secret Wards
 
 Built as a privacy-preserving healthcare data sanitization project.
 
----
-
-## 📜 Disclaimer
-
-Secret Wards is an experimental student challenge project.
-
-It is not a certified anonymization platform, a production healthcare security product, or a substitute for legal, regulatory, or clinical privacy review.
-
-Do not use it to process real patient data without appropriate security controls, validation, and authorization.
-
----
 
 <p align="center">
   <strong>🛡️ Secret Wards — Protecting patient identity while preserving the value of healthcare data.</strong>
