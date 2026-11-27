@@ -140,6 +140,8 @@ def resolve_records(records, registry_path=None):
 
     registry = IdentityRegistry(
         path=registry_path,
+        secret=secret,
+
     )
 
     details = []

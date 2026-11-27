@@ -1,280 +1,442 @@
+
 #!/usr/bin/env python3
-"""Secret Wards starter: a correct *skeleton*, not a solution.
-
-It already does the boring, contract-critical parts right:
-  * walks every input file in a fixed order (deterministic output),
-  * decodes UTF-8 / UTF-8-BOM / UTF-16 / cp1252 and writes UTF-8,
-  * keeps CSV as CSV (same delimiter, same header), JSON as JSON (same structure),
-  * quarantines anything it cannot parse instead of copying it,
-  * writes report.json (SHA-256 per input file, honest counts, timing, memory),
-  * writes records.jsonl with the right locators (row:N, /json/pointer, doc),
-  * gives you keyed HMAC pseudonyms and per-patient date shifting helpers,
-  * never prints, logs or stores personal data or RAKSHA_SECRET.
-
-What it does NOT do is the actual challenge. Search for "TODO(team)".
-As shipped it is roughly the "naive regex" level: it passes CONTRACT OK and scores low.
-
-Usage: python main.py --input <input dir> --output <empty output dir>
-Standard library only, Python 3.10+.
-"""
-from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import csv
-import datetime as dt
 import hashlib
-import hmac
 import io
 import json
-import os
 import re
+import resource
 import sys
 import time
 from pathlib import Path
 
-# --------------------------------------------------------------------------- policy
-def load_policy(path: Path) -> dict:
-    """Tiny `key: value` reader for config/policy.yaml (no PyYAML needed)."""
-    policy = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.split("#", 1)[0].strip()
-            if ":" in line:
-                k, v = (x.strip() for x in line.split(":", 1))
-                policy[k] = int(v) if v.lstrip("-").isdigit() else v
-    return policy
+from modules.ingestion import ingest_file
+from modules.pii_detection import detect_in_text
+from modules.header_classification import classify_csv_column
 
 
-HERE = Path(__file__).resolve().parent
-POLICY = load_policy(HERE / "config" / "policy.yaml")
-SECRET = os.environ.get("RAKSHA_SECRET", "").encode()  # never print or write this
+SUPPORTED = {".csv", ".tsv", ".json", ".txt"}
+REDACTED = "[REDACTED]"
+
+# Deliberately broad: inspect candidate Base64 tokens even when adjacent
+# to punctuation or other text. Binary payloads are preserved unchanged.
+BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
 
 
-# --------------------------------------------------------------------------- pseudonyms & dates
-_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
+def get_sha256(raw):
+    return hashlib.sha256(raw).hexdigest()
 
 
-def pseudonym(patient_key: str) -> str:
-    """Stable, non-reversible ID: HMAC-SHA256 keyed with RAKSHA_SECRET (never a plain hash).
-
-    Same key + same secret -> same ID in every file. A different secret -> a different ID.
-    patient_key should be YOUR canonical identity for a cluster of records (see link_records).
-    """
-    digest = hmac.new(SECRET, patient_key.encode("utf-8"), hashlib.sha256).digest()
-    n = int.from_bytes(digest[:5], "big")
-    code = "".join(_ALPHABET[(n >> (5 * i)) & 31] for i in range(6))
-    return f"PSN-{code}"
+def get_peak_rss_mb():
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return round(usage / (1024 * 1024), 2)
+    return round(usage / 1024, 2)
 
 
-def date_shift_days(patient_key: str) -> int:
-    """Per-patient shift in [-max, +max], never 0. Shift every date of one patient by the
-    SAME amount and a 9-day stay stays 9 days."""
-    m = int(POLICY.get("date_shift_max_days", 180))
-    d = hmac.new(SECRET, b"shift|" + patient_key.encode("utf-8"), hashlib.sha256).digest()
-    v = int.from_bytes(d[:4], "big") % (2 * m) - m
-    return v if v != 0 else 1
+def redact_text(text, field_name=None):
+    if not isinstance(text, str) or not text:
+        return text, 0
 
+    detections = detect_in_text(
+        text,
+        path="doc",
+        source_type="text",
+        field_name=field_name,
+    )
 
-def shift_date(value: dt.date, patient_key: str) -> dt.date:
-    return value + dt.timedelta(days=date_shift_days(patient_key))
+    valid = []
+    for item in detections:
+        start = item.get("start")
+        end = item.get("end")
+        if (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and 0 <= start < end <= len(text)
+        ):
+            valid.append(item)
 
+    valid.sort(key=lambda item: (item["start"], item["end"]), reverse=True)
 
-def age_band(age: int) -> str:
-    """5-year bands by default; the band must CONTAIN the true age."""
-    w = int(POLICY.get("age_band_years", 5))
-    lo = (age // w) * w
-    return f"{lo}-{lo + w - 1}"
+    cleaned = text
+    count = 0
+    last_start = len(text)
 
+    for item in valid:
+        start = item["start"]
+        end = item["end"]
 
-# --------------------------------------------------------------------------- detection
-# TODO(team): this is the part that wins or loses the event. Ideas, in rough order of value:
-#   * column-aware rules: a column named like a name/phone/address is PII whatever it contains
-#     (but expect renamed columns on hidden data: "Patient's Name", "Gram/Mohalla", ...);
-#   * a name gazetteer in Latin AND Devanagari, transliteration (Mohammad/Mohd/Md./मोहम्मद),
-#     honorifics (ji, sahab, didi, श्री), relatives (S/o, D/o, W/o, C/O <name>);
-#   * the meaning traps: "C/O fever" is a complaint, "Dr. Ramesh" stays, "Dolo 650", "5 mg",
-#     "1-0-1" are doses, "Parkinson's disease" is not a person;
-#   * JSON keys, CSV headers, file names and base64 attachments can all hold PII.
-PATTERNS = [
-    ("PHONE", re.compile(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)")),
-    ("AADHAAR", re.compile(r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")),
-    ("EMAIL", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")),
-    ("PAN", re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")),
-    ("NAME", re.compile(r"(?i)(?<=name:)\s*[^\n,;|]+")),
-]
-
-
-class Stats:
-    identifiers = 0
-    records = 0
-    linked = 0
-    generalized = 0
-    suppressed = 0
-
-
-def clean_text(text: str) -> str:
-    """Replace detected identifiers with typed placeholders. TODO(team): much more than regex."""
-    for kind, rx in PATTERNS:
-        text, n = rx.subn(f"[{kind}]" if kind != "NAME" else " [NAME]", text)
-        Stats.identifiers += n
-    return text
-
-
-def clean_value(v):
-    if isinstance(v, str):
-        return clean_text(v)
-    if isinstance(v, list):
-        return [clean_value(x) for x in v]
-    if isinstance(v, dict):
-        # JSON keys can be PII too (for example a dict keyed by patient name)
-        return {clean_text(k): clean_value(x) for k, x in v.items()}
-    return v  # numbers, booleans, null keep their type
-
-
-# --------------------------------------------------------------------------- linkage
-def link_records(_record_text: str):
-    """Return a canonical patient key for a record, or None when the evidence is too weak.
-
-    TODO(team): blocking + fuzzy/phonetic + cross-script matching across ALL files, then cluster
-    without transitive over-merging. Two different people with the same name must stay apart.
-    A wrong link costs more than no link, so the starter links nothing.
-    """
-    return None
-
-
-# --------------------------------------------------------------------------- I/O
-def decode(raw: bytes) -> str | None:
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8", errors="strict")
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
-    for enc in ("utf-8", "cp1252"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
+        if end > last_start:
             continue
-    return None
+
+        cleaned = cleaned[:start] + REDACTED + cleaned[end:]
+        last_start = start
+        count += 1
+
+    return cleaned, count
 
 
-def process_csv(text: str, delimiter: str, rel: str, records: list) -> str:
-    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
-    if not rows:
-        return ""
-    header, body = rows[0], rows[1:]
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-    w.writerow(header)  # TODO(team): rename a header only if it contains PII
-    for i, row in enumerate(body):
-        key = link_records(delimiter.join(row))
-        pid = pseudonym(key) if key else None
-        # TODO(team): write pid into the row's patient column so it appears INSIDE the record
-        w.writerow([clean_text(c) for c in row])
-        records.append({"file": f"sanitized/{rel}", "loc": f"row:{i}", "patient": pid})
-        Stats.records += 1
-        Stats.linked += pid is not None
-    return buf.getvalue()
+def clean_embedded_base64(text, field_name=None):
+    if not isinstance(text, str) or not text:
+        return text, 0
 
+    total = 0
 
-def process_json(text: str, rel: str, records: list) -> str:
-    data = json.loads(text)
-    is_doc = not isinstance(data, dict) or data.get("resourceType") == "Bundle" or not any(
-        isinstance(v, list) and v and all(isinstance(x, dict) for x in v) for v in data.values())
-    if is_doc:  # FHIR Bundle or single object: one record for the whole file
-        records.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})
-        Stats.records += 1
-    else:
-        for k, v in data.items():
-            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-                for i, _ in enumerate(v):
-                    pointer_key = k.replace("~", "~0").replace("/", "~1")
-                    records.append({"file": f"sanitized/{rel}", "loc": f"/{pointer_key}/{i}", "patient": None})
-                    Stats.records += 1
-    # TODO(team): FHIR must stay a valid R4 Bundle whose references resolve
-    return json.dumps(clean_value(data), ensure_ascii=False, indent=2) + "\n"
+    def replace_match(match):
+        nonlocal total
 
+        token = match.group(0)
 
-def process_text(text: str, rel: str, records: list) -> str:
-    records.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})
-    Stats.records += 1
-    return clean_text(text)
+        # Avoid decoding arbitrary fragments of longer tokens.
+        if len(token) % 4 == 1:
+            return token
 
-
-def peak_rss_mb() -> float:
-    try:
-        import resource
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return round(r / 1024 if sys.platform != "darwin" else r / 1048576, 1)
-    except Exception:  # noqa: BLE001 - not available on every OS
-        return 0.0
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Secret Wards starter pipeline")
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    a = ap.parse_args()
-    t0 = time.monotonic()
-    inp, out = Path(a.input), Path(a.output)
-    san = out / "sanitized"
-    san.mkdir(parents=True, exist_ok=True)
-    files, records = [], []
-    sys.setrecursionlimit(5000)
-
-    for path in sorted(p for p in inp.rglob("*") if p.is_file()):
-        rel = path.relative_to(inp).as_posix()
-        raw = path.read_bytes()
-        entry = {"input_sha256": hashlib.sha256(raw).hexdigest()}
-        ext = path.suffix.lower()
         try:
-            if ext not in (".csv", ".tsv", ".json", ".txt"):
-                raise ValueError("unsupported_format")
-            if not raw.strip():
-                raise ValueError("empty_file")
-            text = decode(raw)
-            if text is None:
-                raise ValueError("undecodable_text")
-            # TODO(team): a file NAME can contain PII: rename it and report the new path
-            if ext in (".csv", ".tsv"):
-                result = process_csv(text, "\t" if ext == ".tsv" else ",", rel, records)
-            elif ext == ".json":
-                result = process_json(text, rel, records)
+            padded = token + "=" * (-len(token) % 4)
+            decoded = base64.b64decode(padded, validate=True)
+
+            # Only inspect text-like payloads. Preserve binary payloads.
+            decoded_text = decoded.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return token
+
+        cleaned, count = redact_text(decoded_text, field_name)
+
+        if count == 0:
+            return token
+
+        total += count
+        return base64.b64encode(cleaned.encode("utf-8")).decode("ascii")
+
+    return BASE64_PATTERN.sub(replace_match, text), total
+
+
+def clean_base64(value, field_name=None):
+    return clean_embedded_base64(value, field_name)
+
+
+def safe_field_name(field_name):
+    if field_name is None:
+        return None
+
+    category = classify_csv_column(str(field_name))
+    return category if category else str(field_name)
+
+
+def clean_value(value, field_name=None):
+    if isinstance(value, str):
+        field = safe_field_name(field_name)
+
+        cleaned, count = clean_embedded_base64(value, field)
+        cleaned, found = redact_text(cleaned, field)
+
+        return cleaned, count + found
+
+    if isinstance(value, list):
+        cleaned = []
+        count = 0
+
+        for item in value:
+            result, found = clean_value(item, field_name)
+            cleaned.append(result)
+            count += found
+
+        return cleaned, count
+
+    if isinstance(value, dict):
+        cleaned = {}
+        count = 0
+        protected_number = 1
+
+        for key, item in value.items():
+            original_key = str(key)
+            category = classify_csv_column(original_key)
+
+            # Do not expose potentially identifying field names.
+            if category:
+                clean_key = f"protected_field_{protected_number}"
+                protected_number += 1
             else:
-                result = process_text(text, rel, records)
-            dest = san / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(result, encoding="utf-8", newline="")
-            entry.update(output=f"sanitized/{rel}", status="sanitized")
-        except (ValueError, RecursionError, UnicodeError, csv.Error) as exc:
-            # Fail safe: never copy what we could not clean. The reason holds no file content.
-            reason = str(exc) if isinstance(exc, ValueError) and str(exc).isidentifier() else type(exc).__name__
-            entry.update(output=None, status="quarantined", reason=reason)
-        files.append(entry)
+                clean_key, found_key = redact_text(original_key)
+                count += found_key
 
-    # Records whose file ended up quarantined must not be listed
-    exported = {e["output"] for e in files if e["output"]}
-    records = [r for r in records if r["file"] in exported]
+                if clean_key != original_key:
+                    clean_key = f"protected_field_{protected_number}"
+                    protected_number += 1
 
-    with open(out / "records.jsonl", "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+            clean_item, found_item = clean_value(item, original_key)
 
-    n_san = sum(e["status"] == "sanitized" for e in files)
+            if clean_key in cleaned:
+                clean_key = f"protected_field_{protected_number}"
+                protected_number += 1
+
+            cleaned[clean_key] = clean_item
+            count += found_item
+
+        return cleaned, count
+
+    return value, 0
+
+
+def clean_csv(text, delimiter):
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+
+    if not rows:
+        return "", 0
+
+    headers = rows[0]
+    sensitive_columns = set()
+    safe_headers = []
+    total = 0
+
+    for index, header in enumerate(headers):
+        category = classify_csv_column(header)
+
+        if category:
+            sensitive_columns.add(index)
+            safe_headers.append(f"protected_field_{index + 1}")
+        else:
+            cleaned, found = redact_text(header)
+            safe_headers.append(cleaned)
+            total += found
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
+    writer.writerow(safe_headers)
+
+    for row in rows[1:]:
+        cleaned_row = []
+
+        for index, value in enumerate(row):
+            field_name = headers[index] if index < len(headers) else None
+
+            if index in sensitive_columns:
+                cleaned_row.append(REDACTED)
+                total += 1
+                continue
+
+            cleaned, found = clean_embedded_base64(value, field_name)
+            cleaned, extra = redact_text(cleaned, safe_field_name(field_name))
+
+            cleaned_row.append(cleaned)
+            total += found + extra
+
+        writer.writerow(cleaned_row)
+
+    return output.getvalue(), total
+
+
+def clean_json(text):
+    data = json.loads(text)
+    cleaned, count = clean_value(data)
+
+    return (
+        json.dumps(cleaned, ensure_ascii=False, indent=2) + "\n",
+        count,
+    )
+
+
+def clean_txt(text):
+    cleaned, count = clean_embedded_base64(text)
+    cleaned, found = redact_text(cleaned)
+    return cleaned, count + found
+
+
+def get_safe_path(relative_path, used_paths):
+    suffix = Path(relative_path).suffix.lower()
+
+    if suffix not in SUPPORTED:
+        raise ValueError("unsupported_format")
+
+    number = len(used_paths) + 1
+    safe_name = f"record_{number:06d}{suffix}"
+
+    while safe_name in used_paths:
+        number += 1
+        safe_name = f"record_{number:06d}{suffix}"
+
+    used_paths.add(safe_name)
+    return safe_name
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    start = time.monotonic()
+    input_root = Path(args.input).resolve()
+    output_root = Path(args.output).resolve()
+    sanitized_root = output_root / "sanitized"
+
+    if not input_root.is_dir():
+        raise SystemExit("Input directory not found")
+
+    sanitized_root.mkdir(parents=True, exist_ok=True)
+
+    files = []
+    records = []
+    used_paths = set()
+    identifiers_detected = 0
+
+    input_files = sorted(
+        path for path in input_root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    )
+
+    for path in input_files:
+        file_hash = None
+
+        try:
+            raw = path.read_bytes()
+            file_hash = get_sha256(raw)
+            extension = path.suffix.lower()
+
+            if extension not in SUPPORTED:
+                raise ValueError("unsupported_format")
+
+            result = ingest_file(
+                path,
+                hospital_id=None,
+                input_root=input_root,
+            )
+
+            if result.get("status") != "SUCCESS":
+                raise ValueError("ingestion_failed")
+
+            encoding = result.get("metadata", {}).get(
+                "encoding", "utf-8-sig"
+            )
+
+            text = raw.decode(encoding)
+            safe_path = get_safe_path(
+                path.relative_to(input_root).as_posix(),
+                used_paths,
+            )
+
+            if extension in (".csv", ".tsv"):
+                delimiter = "\t" if extension == ".tsv" else ","
+                cleaned, count = clean_csv(text, delimiter)
+
+                row_count = max(
+                    0,
+                    sum(
+                        1 for _ in csv.reader(
+                            io.StringIO(text),
+                            delimiter=delimiter,
+                        )
+                    ) - 1,
+                )
+
+                for row in range(row_count):
+                    records.append({
+                        "file": f"sanitized/{safe_path}",
+                        "loc": f"row:{row}",
+                        "patient": None,
+                    })
+
+            elif extension == ".json":
+                cleaned, count = clean_json(text)
+
+                records.append({
+                    "file": f"sanitized/{safe_path}",
+                    "loc": "doc",
+                    "patient": None,
+                })
+
+            else:
+                cleaned, count = clean_txt(text)
+
+                records.append({
+                    "file": f"sanitized/{safe_path}",
+                    "loc": "doc",
+                    "patient": None,
+                })
+
+            destination = sanitized_root / safe_path
+            destination.write_text(cleaned, encoding="utf-8")
+
+            identifiers_detected += count
+
+            files.append({
+                "input_sha256": file_hash,
+                "output": f"sanitized/{safe_path}",
+                "status": "sanitized",
+            })
+
+        except Exception as exc:
+            # Do not put source paths, values or exception messages in reports.
+            files.append({
+                "input_sha256": file_hash,
+                "output": None,
+                "status": "quarantined",
+                "reason": type(exc).__name__,
+            })
+
+    valid_outputs = {
+        item["output"]
+        for item in files
+        if item["status"] == "sanitized"
+    }
+
+    records = [
+        item for item in records
+        if item["file"] in valid_outputs
+    ]
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    with (output_root / "records.jsonl").open(
+        "w", encoding="utf-8"
+    ) as file:
+        for record in records:
+            file.write(
+                json.dumps(record, ensure_ascii=False) + "\n"
+            )
+
+    sanitized_count = sum(
+        item["status"] == "sanitized" for item in files
+    )
+
     report = {
         "schema": "raksha-report/1",
         "files": files,
         "counts": {
-            "files_total": len(files), "files_sanitized": n_san, "files_quarantined": len(files) - n_san,
-            "records_processed": len(records), "identifiers_detected": Stats.identifiers,
-            "records_linked": sum(r["patient"] is not None for r in records),
-            "records_generalized": Stats.generalized, "records_suppressed": Stats.suppressed,
+            "files_total": len(files),
+            "files_sanitized": sanitized_count,
+            "files_quarantined": len(files) - sanitized_count,
+            "records_processed": len(records),
+            "identifiers_detected": identifiers_detected,
+            "records_linked": 0,
+            "records_generalized": 0,
+            "records_suppressed": 0,
             "records_quarantined": 0,
         },
-        "timing": {"seconds": round(time.monotonic() - t0, 2)},
-        "resources": {"peak_rss_mb": peak_rss_mb()},
+        "timing": {
+            "seconds": round(time.monotonic() - start, 2),
+        },
+        "resources": {
+            "peak_rss_mb": get_peak_rss_mb(),
+        },
     }
-    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    # Only counts go to stdout: stdout and stderr are scanned for PII.
-    print(f"files {len(files)} sanitized {n_san} quarantined {len(files) - n_san} records {len(records)}")
+
+    (output_root / "report.json").write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8",
+    )
+
+    print(
+        f"files {len(files)} "
+        f"sanitized {sanitized_count} "
+        f"quarantined {len(files) - sanitized_count} "
+        f"records {len(records)}"
+    )
+
     return 0
 
 
