@@ -37,7 +37,7 @@ PATTERNS = {
         r"(?<!\d)(?:\d{4}[ -]?){2}\d{4}(?!\d)"
     ),
     "PHONE": re.compile(
-        r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)"
+        r"(?<!\d)(?:\+91[ \t-]?)?[6-9]\d{4}[ \t-]?\d{5}(?!\d)"
     ),
     "PAN": re.compile(
         r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -87,6 +87,10 @@ RELATIVE_LABELS = re.compile(
 PATIENT_LABELS = re.compile(
     r"(?:patient name|patient|नाम|रोगी का नाम)"
     r"\s*[:\-]\s*([^\n,;]{2,60})",
+    re.IGNORECASE
+)
+REPORT_OF_PATTERN = re.compile(
+    r"\bReport\s+of\s+([^\n,;]{2,60}?)\s+behenji\b",
     re.IGNORECASE
 )
 
@@ -254,7 +258,30 @@ def detect_in_text(
         add_detection(
             "RELATIVE_NAME", start, end, "context_rule", 0.85
         )
+        
+   
+    for match in REPORT_OF_PATTERN.finditer(text):
+        name = match.group(1)
+        start = match.start(1)
+        end = match.end(1)
 
+        
+        while name and name[0].isspace():
+            name = name[1:]
+            start += 1
+
+        while name and name[-1].isspace():
+            name = name[:-1]
+            end -= 1
+
+        if name:
+            add_detection(
+                "PATIENT_NAME",
+                start,
+                end,
+                "whatsapp_report_rule",
+                0.95
+            )
     # Detect patient names after patient-related labels.
     for match in PATIENT_LABELS.finditer(text):
         name = match.group(1)
