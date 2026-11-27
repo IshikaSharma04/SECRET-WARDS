@@ -39,6 +39,7 @@ class TestNormalization(unittest.TestCase):
 
     def test_builds_normalized_record(self):
         results = build_normalized_records(self.ingestion_result)
+
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["record_id"], "REC_001")
 

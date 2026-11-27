@@ -6,7 +6,7 @@ def identify_hospital(metadata):
 
     evidence = []
 
-    # 1. Check JSON document metadata
+    # 1. Check JSON document metadata.
     document_metadata = metadata.get("document_metadata", {})
 
     if isinstance(document_metadata, dict):
@@ -21,7 +21,7 @@ def identify_hospital(metadata):
                     "evidence_source": "json_metadata"
                 })
 
-    # 2. Check explicit hospital fields
+    # 2. Check explicit hospital fields.
     explicit_fields = [
         "hospital_name",
         "hospital",
@@ -38,7 +38,7 @@ def identify_hospital(metadata):
                 "evidence_source": "explicit_field"
             })
 
-    # 3. Check FHIR Organization resource
+    # 3. Check FHIR Organization resource.
     if metadata.get("resourceType") == "Organization":
         hospital_name = metadata.get("name")
 
@@ -48,7 +48,7 @@ def identify_hospital(metadata):
                 "evidence_source": "fhir_organization"
             })
 
-    # 4. No reliable hospital evidence found
+    # 4. No reliable hospital evidence found.
     if not evidence:
         return {
             "hospital_name": None,
@@ -56,7 +56,7 @@ def identify_hospital(metadata):
             "confidence": "unknown"
         }
 
-    # 5. Check whether all evidence identifies the same hospital
+    # 5. Reject conflicting hospital evidence.
     unique_names = {
         item["hospital_name"].casefold()
         for item in evidence
@@ -69,7 +69,7 @@ def identify_hospital(metadata):
             "confidence": "unknown"
         }
 
-    # 6. Return the strongest available evidence
+    # 6. Return the first available evidence when consistent.
     return {
         "hospital_name": evidence[0]["hospital_name"],
         "evidence_source": evidence[0]["evidence_source"],

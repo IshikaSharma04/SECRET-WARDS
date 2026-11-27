@@ -16,12 +16,17 @@ class RegistryConflictError(Exception):
 class IdentityRegistry:
     def __init__(self, path=None, secret=None):
         if secret is None:
-            secret_value = os.getenv("RAKSHA_REGISTRY_SECRET")
+            master_secret = os.getenv("RAKSHA_SECRET")
 
-            if not secret_value or not secret_value.strip():
-                raise RuntimeError("RAKSHA_REGISTRY_SECRET is missing")
+            if not master_secret or not master_secret.strip():
+                raise RuntimeError("RAKSHA_SECRET is missing")
 
-            secret = secret_value.encode("utf-8")
+            # Derive a separate key for identity registry operations.
+            secret = hmac.new(
+                master_secret.encode("utf-8"),
+                b"RAKSHA:IDENTITY-REGISTRY-KEY:v1",
+                hashlib.sha256
+            ).digest()
 
         if not isinstance(secret, bytes) or not secret:
             raise ValueError("Invalid registry secret")
@@ -60,7 +65,10 @@ class IdentityRegistry:
         used_fingerprints = set()
 
         for canonical_id, details in identities.items():
-            if not isinstance(canonical_id, str) or not canonical_id.startswith("CAN_"):
+            if (
+                not isinstance(canonical_id, str)
+                or not canonical_id.startswith("CAN_")
+            ):
                 raise ValueError("Invalid canonical ID")
 
             if not isinstance(details, dict):
@@ -72,7 +80,14 @@ class IdentityRegistry:
                 raise ValueError("Invalid fingerprints")
 
             for fingerprint in fingerprints:
-                if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+                if (
+                    not isinstance(fingerprint, str)
+                    or len(fingerprint) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in fingerprint
+                    )
+                ):
                     raise ValueError("Invalid fingerprint")
 
                 if fingerprint in used_fingerprints:
@@ -144,7 +159,7 @@ class IdentityRegistry:
         canonical_id = self.find_identity(identifiers)
 
         if canonical_id is None:
-            # Generate the internal ID only once and keep it in the registry.
+            # Generate the internal ID only once and persist it.
             canonical_id = "CAN_" + uuid.uuid4().hex.upper()
 
             self.data["identities"][canonical_id] = {
@@ -156,7 +171,10 @@ class IdentityRegistry:
         return canonical_id
 
     def add_identifiers(self, canonical_id, identifiers):
-        if not isinstance(canonical_id, str) or not canonical_id.startswith("CAN_"):
+        if (
+            not isinstance(canonical_id, str)
+            or not canonical_id.startswith("CAN_")
+        ):
             raise ValueError("Invalid canonical ID")
 
         fingerprints = self.get_fingerprints(identifiers)
@@ -208,6 +226,9 @@ class IdentityRegistry:
 
         except OSError as error:
             if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
             raise RuntimeError("Could not save identity registry") from error
