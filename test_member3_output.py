@@ -284,7 +284,7 @@ def test_safe_filename_is_not_flagged():
     ) == []
 
 
-from starter.main import classify_csv_column
+from modules.header_classification import classify_csv_column
 
 
 def test_registration_headers_are_classified():
@@ -316,7 +316,7 @@ def test_sensitive_folder_and_filename_are_detected():
 
 
 def test_hinglish_registration_headers_are_classified():
-    from starter.main import classify_csv_column
+    from modules.header_classification import classify_csv_column
 
     expected = {
         "Reg No": "UHID",
@@ -339,7 +339,7 @@ def test_hinglish_registration_headers_are_classified():
         assert classify_csv_column(header) == expected_category
 
 def test_arogya_registration_headers():
-    from starter.main import classify_csv_column
+    from modules.header_classification import classify_csv_column
 
     expected = {
         "PatientID": "UHID",
