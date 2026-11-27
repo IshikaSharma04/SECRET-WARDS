@@ -4,7 +4,6 @@ import re
 from modules.identity import normalize_name
 
 
-# Fields that directly contain personal information.
 FIELD_CATEGORIES = {
     "patient_name": "PATIENT_NAME",
     "relative_name": "RELATIVE_NAME",
@@ -29,15 +28,12 @@ FIELD_CATEGORIES = {
     "insurance_id": "INSURANCE_ID",
 }
 
-
-# General identifier patterns.
-# These patterns can identify values without needing a label.
 PATTERNS = {
     "AADHAAR": re.compile(
         r"(?<!\d)(?:\d{4}[ -]?){2}\d{4}(?!\d)"
     ),
     "PHONE": re.compile(
-        r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)"
+        r"(?<!\d)(?:\+91[ \t-]?)?[6-9]\d{4}[ \t-]?\d{5}(?!\d)"
     ),
     "PAN": re.compile(
         r"\b[A-Z]{5}\d{4}[A-Z]\b",
@@ -45,9 +41,11 @@ PATTERNS = {
     ),
 }
 
+REPORT_OF_PATTERN = re.compile(
+    r"\bReport\s+of\s+([^\n,;]{2,60}?)\s+behenji\b",
+    re.IGNORECASE
+)
 
-# These identifiers require a label before their value.
-# The captured group contains only the identifier, not its label.
 LABELLED_PATTERNS = {
     "ABHA": re.compile(
         r"\bABHA(?:\s*(?:ID|NO\.?|NUMBER))?"
@@ -72,55 +70,57 @@ LABELLED_PATTERNS = {
     ),
 }
 
-
-# Labels that can introduce a relative's name.
 RELATIVE_LABELS = re.compile(
-    r"(?:C/O|S/O|D/O|W/O|F/O|"
-    r"relative name|guardian name|father name|mother name|"
-    r"पिता|माता|पति|पत्नी|अभिभावक)"
+    r"(?:"
+    r"C/O|S/O|D/O|W/O|F/O|"
+    r"relative\s+name|guardian\s+name|"
+    r"father\s+name|mother\s+name|"
+    r"पिता(?:\s+का\s+नाम)?|"
+    r"माता(?:\s+का\s+नाम)?|"
+    r"पति(?:\s+का\s+नाम)?|"
+    r"पत्नी(?:\s+का\s+नाम)?|"
+    r"अभिभावक(?:\s+का\s+नाम)?"
+    r")"
     r"\s*[:\-]?\s*([^\n,;]{2,60})",
     re.IGNORECASE
 )
 
-
-# Labels that can introduce a patient's name.
 PATIENT_LABELS = re.compile(
-    r"(?:patient name|patient|नाम|रोगी का नाम)"
+    r"(?:"
+    r"patient\s+name|patient|"
+    r"नाम|रोगी\s+का\s+नाम|मरीज\s+का\s+नाम"
+    r")"
     r"\s*[:\-]\s*([^\n,;]{2,60})",
     re.IGNORECASE
 )
 
-
-# Common medical words that should not be treated as names.
 MEDICAL_WORDS = {
     "fever", "cough", "cold", "pain", "vomiting",
     "diabetes", "hypertension", "dengue", "malaria",
     "headache", "weakness", "breathlessness",
-    "बुखार", "खांसी", "दर्द", "उल्टी"
+    "बुखार", "खांसी", "खाँसी", "दर्द", "उल्टी",
 }
+
+DOCTOR_PREFIX = re.compile(
+    r"(?:dr\.?|doctor|डॉ\.?|डॉक्टर)$",
+    re.IGNORECASE
+)
 
 
 def get_language(text):
-    """Identify the script used in the text."""
-
     has_hindi = any("\u0900" <= char <= "\u097f" for char in text)
     has_english = any(char.isascii() and char.isalpha() for char in text)
 
     if has_hindi and has_english:
         return "hinglish"
-
     if has_hindi:
         return "hi"
-
     if has_english:
         return "en"
-
     return "unknown"
 
 
 def normalize_field(field):
-    """Make field names easier to compare."""
-
     field = str(field).lower().strip()
     return re.sub(r"[^a-z0-9]+", "_", field).strip("_")
 
@@ -153,11 +153,70 @@ def make_detection(
 
     if record_id is not None:
         detection["record_id"] = record_id
-
     if source_file is not None:
         detection["source_file"] = source_file
 
     return detection
+
+
+def compile_known_names(known_names):
+    if not known_names:
+        return {}
+
+    if isinstance(known_names, dict):
+        name_groups = known_names.items()
+    else:
+        name_groups = [("PATIENT_NAME", known_names)]
+
+    compiled = {}
+
+    for category, names in name_groups:
+        if category not in ("PATIENT_NAME", "RELATIVE_NAME"):
+            continue
+
+        if isinstance(names, str):
+            names = [names]
+
+        alternatives = set()
+
+        for name in names:
+            if not isinstance(name, str):
+                continue
+
+            normalized_name = normalize_name(name)
+            if not normalized_name:
+                continue
+
+            parts = normalized_name.split()
+            if not parts:
+                continue
+
+            name_pattern = r"[\W_]+".join(
+                re.escape(part) for part in parts
+            )
+            alternatives.add(name_pattern)
+
+        if not alternatives:
+            continue
+
+        ordered_alternatives = sorted(
+            alternatives,
+            key=len,
+            reverse=True
+        )
+
+        combined_pattern = (
+            r"(?<!\w)(?:"
+            + "|".join(ordered_alternatives)
+            + r")(?!\w)"
+        )
+
+        compiled[category] = re.compile(
+            combined_pattern,
+            re.IGNORECASE
+        )
+
+    return compiled
 
 
 def detect_in_text(
@@ -168,16 +227,14 @@ def detect_in_text(
     known_names=None,
     record_id=None,
     source_file=None,
-    target="value"
+    target="value",
+    compiled_known_names=None
 ):
-    """Find personal information inside one text value."""
-
     detections = []
     language = get_language(text)
     field = normalize_field(field_name or "")
 
     def add_detection(category, start, end, method, confidence):
-        # Avoid reporting the same characters twice.
         for item in detections:
             if start < item["end"] and end > item["start"]:
                 return
@@ -198,7 +255,6 @@ def detect_in_text(
             )
         )
 
-    # Check whether the field itself identifies PII.
     category = FIELD_CATEGORIES.get(field)
 
     if category:
@@ -206,7 +262,6 @@ def detect_in_text(
             category, 0, len(text), "field_match", 0.99
         )
 
-    # Detect Aadhaar, phone numbers and PAN.
     for category, pattern in PATTERNS.items():
         for match in pattern.finditer(text):
             add_detection(
@@ -217,12 +272,9 @@ def detect_in_text(
                 0.95
             )
 
-    # Detect identifiers that require a label.
     for category, pattern in LABELLED_PATTERNS.items():
         for match in pattern.finditer(text):
-            # Capture only the identifier value.
             start, end = match.span(1)
-
             add_detection(
                 category,
                 start,
@@ -231,7 +283,6 @@ def detect_in_text(
                 0.95
             )
 
-    # Detect relative names after labels such as C/O or S/O.
     for match in RELATIVE_LABELS.finditer(text):
         name = match.group(1)
         start = match.start(1)
@@ -252,10 +303,13 @@ def detect_in_text(
             continue
 
         add_detection(
-            "RELATIVE_NAME", start, end, "context_rule", 0.85
+            "RELATIVE_NAME",
+            start,
+            end,
+            "context_rule",
+            0.85
         )
 
-    # Detect patient names after patient-related labels.
     for match in PATIENT_LABELS.finditer(text):
         name = match.group(1)
         start = match.start(1)
@@ -267,69 +321,45 @@ def detect_in_text(
 
         if name:
             add_detection(
-                "PATIENT_NAME", start, end, "context_rule", 0.90
+                "PATIENT_NAME",
+                start,
+                end,
+                "context_rule",
+                0.90
             )
 
-    # Compare names collected from structured patient records.
-    if known_names:
-        if isinstance(known_names, dict):
-            name_groups = known_names.items()
-        else:
-            name_groups = [("PATIENT_NAME", known_names)]
+    for match in REPORT_OF_PATTERN.finditer(text):
+        start, end = match.span(1)
+        add_detection(
+            "PATIENT_NAME",
+            start,
+            end,
+            "whatsapp_report_rule",
+            0.95
+        )
 
-        for category, names in name_groups:
-            if isinstance(names, str):
-                names = [names]
+    if compiled_known_names is None:
+        compiled_known_names = compile_known_names(known_names)
 
-            for name in names:
-                if not isinstance(name, str):
-                    continue
+    for category, pattern in compiled_known_names.items():
+        for match in pattern.finditer(text):
+            previous_text = text[:match.start()].rstrip()
 
-                # Normalize the known name before comparing it.
-                normalized_name = normalize_name(name)
+            if DOCTOR_PREFIX.search(previous_text):
+                continue
 
-                if not normalized_name:
-                    continue
-
-                if category not in ("PATIENT_NAME", "RELATIVE_NAME"):
-                    continue
-
-                # Allow different spaces and punctuation between words.
-                name_parts = normalized_name.split()
-                name_pattern = r"[\W_]+".join(
-                    re.escape(part) for part in name_parts
-                )
-
-                pattern = re.compile(
-                    r"(?<!\w)" + name_pattern + r"(?!\w)",
-                    re.IGNORECASE
-                )
-
-                for match in pattern.finditer(text):
-                    previous_text = text[:match.start()].rstrip().lower()
-
-                    # Avoid automatically marking a doctor's name
-                    # as a patient name.
-                    if re.search(
-                        r"(?:dr\.?|doctor|डॉ\.?)$",
-                        previous_text
-                    ):
-                        continue
-
-                    add_detection(
-                        category,
-                        match.start(),
-                        match.end(),
-                        "known_name",
-                        0.90
-                    )
+            add_detection(
+                category,
+                match.start(),
+                match.end(),
+                "known_name",
+                0.90
+            )
 
     return detections
 
 
 def join_path(parent, child):
-    """Build a path for nested JSON data."""
-
     child = str(child).replace("~", "~0").replace("/", "~1")
 
     if parent == "/":
@@ -346,15 +376,8 @@ def detect_pii(
     record_id=None,
     source_file=None
 ):
-    """
-    Detect PII in text, dictionaries and lists.
-
-    Character positions start at zero.
-    The end position is exclusive.
-    Positions always refer to the original text.
-    """
-
     detections = []
+    compiled_known_names = compile_known_names(known_names)
 
     def check_value(value, path, field_name=None):
         if isinstance(value, str):
@@ -365,7 +388,8 @@ def detect_pii(
                 field_name,
                 known_names,
                 record_id,
-                source_file
+                source_file,
+                compiled_known_names=compiled_known_names
             )
             detections.extend(found)
 
@@ -373,7 +397,6 @@ def detect_pii(
             for key, item in value.items():
                 child_path = join_path(path, key)
 
-                # Check keys as well as values.
                 detections.extend(
                     detect_in_text(
                         str(key),
@@ -382,7 +405,8 @@ def detect_pii(
                         known_names=known_names,
                         record_id=record_id,
                         source_file=source_file,
-                        target="key"
+                        target="key",
+                        compiled_known_names=compiled_known_names
                     )
                 )
 
@@ -395,7 +419,6 @@ def detect_pii(
 
     check_value(data, base_path)
 
-    # Sort detections so replacements can happen from right to left.
     detections.sort(
         key=lambda item: (item["path"], -item["start"])
     )
@@ -409,11 +432,21 @@ def detect_filename_pii(
     record_id=None,
     source_file=None
 ):
-    """Check whether a filename or folder path contains PII."""
+    """Detect PII in filenames even when labels use filename separators."""
+
+    # Filenames commonly use underscores or hyphens instead of spaces.
+    # Convert those separators so labelled patterns such as MRN and UHID
+    # can recognize identifiers embedded in filenames.
+    searchable_path = re.sub(
+        r"[\W_]+",
+        " ",
+        str(relative_path),
+        flags=re.UNICODE
+    )
 
     return detect_in_text(
-        relative_path,
-        relative_path,
+        searchable_path,
+        str(relative_path),
         "filename",
         known_names=known_names,
         record_id=record_id,

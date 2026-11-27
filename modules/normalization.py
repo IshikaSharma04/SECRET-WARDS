@@ -1,93 +1,14 @@
 
 from copy import deepcopy
 
-from modules.identity import normalize_name
+from modules.identity_extraction import extract_identity_candidates
 from modules.pii_detection import detect_pii, detect_filename_pii
 from modules.hospital_identification import identify_hospital
 
 
-PATIENT_NAME_FIELDS = [
-    "patient_name",
-    "patient_full_name"
-]
-
-RELATIVE_NAME_FIELDS = {
-    "relative_name": "relative",
-    "guardian_name": "guardian",
-    "father_name": "father",
-    "mother_name": "mother"
-}
-
-IDENTIFIER_FIELDS = {
-    "uhid": "UHID",
-    "mrn": "UHID",
-    "aadhaar": "AADHAAR",
-    "aadhaar_no": "AADHAAR",
-    "abha": "ABHA",
-    "abha_no": "ABHA",
-    "pan": "PAN",
-    "payer_pan": "PAN",
-    "policy_no": "INSURANCE_ID",
-    "insurance_id": "INSURANCE_ID"
-}
-
-
-def extract_identity_candidates(data):
-    candidates = {
-        "patient_names": [],
-        "relative_names": [],
-        "identifiers": []
-    }
-
-    if not isinstance(data, dict):
-        return candidates
-
-    for field in PATIENT_NAME_FIELDS:
-        value = data.get(field)
-
-        if isinstance(value, str) and value.strip():
-            normalized = normalize_name(value)
-
-            if normalized:
-                candidates["patient_names"].append({
-                    "value": value.strip(),
-                    "normalized_value": normalized,
-                    "confidence": 0.99
-                })
-
-    for field, relation in RELATIVE_NAME_FIELDS.items():
-        value = data.get(field)
-
-        if isinstance(value, str) and value.strip():
-            normalized = normalize_name(value)
-
-            if normalized:
-                candidates["relative_names"].append({
-                    "value": value.strip(),
-                    "normalized_value": normalized,
-                    "relation": relation,
-                    "confidence": 0.95
-                })
-
-    for field, identifier_type in IDENTIFIER_FIELDS.items():
-        value = data.get(field)
-
-        if isinstance(value, str) and value.strip():
-            identifier = {
-                "type": identifier_type,
-                "value": value.strip(),
-                "confidence": 0.99 if identifier_type == "UHID" else 0.95
-            }
-
-            if identifier_type in ("AADHAAR", "ABHA"):
-                identifier["verified"] = False
-
-            candidates["identifiers"].append(identifier)
-
-    return candidates
-
-
 def get_hospital_information(data, document_metadata, all_records):
+    hospital_evidence = []
+
     hospital_input = {
         "document_metadata": document_metadata
     }
@@ -98,8 +19,9 @@ def get_hospital_information(data, document_metadata, all_records):
     hospital = identify_hospital(hospital_input)
 
     if hospital["hospital_name"] is not None:
-        return hospital
+        hospital_evidence.append(hospital)
 
+    # Check Organization resources as additional hospital evidence.
     for item in all_records:
         if not isinstance(item, dict):
             continue
@@ -110,16 +32,34 @@ def get_hospital_information(data, document_metadata, all_records):
             continue
 
         if record_data.get("resourceType") == "Organization":
-            hospital = identify_hospital(record_data)
+            organization_hospital = identify_hospital(record_data)
 
-            if hospital["hospital_name"] is not None:
-                return hospital
+            if organization_hospital["hospital_name"] is not None:
+                hospital_evidence.append(organization_hospital)
 
-    return {
-        "hospital_name": None,
-        "evidence_source": None,
-        "confidence": "unknown"
+    if not hospital_evidence:
+        return {
+            "hospital_name": None,
+            "evidence_source": None,
+            "confidence": "unknown"
+        }
+
+    hospital_names = {
+        evidence["hospital_name"].strip().casefold()
+        for evidence in hospital_evidence
+        if isinstance(evidence.get("hospital_name"), str)
+        and evidence["hospital_name"].strip()
     }
+
+    # Do not guess when different hospital identities are present.
+    if len(hospital_names) != 1:
+        return {
+            "hospital_name": None,
+            "evidence_source": None,
+            "confidence": "unknown"
+        }
+
+    return hospital_evidence[0]
 
 
 def build_normalized_records(ingestion_result, known_names=None):
@@ -141,12 +81,18 @@ def build_normalized_records(ingestion_result, known_names=None):
 
     source_file = ingestion_result.get("source_file")
     file_format = ingestion_result.get("format")
-
     hospital_id = metadata.get("hospital_id")
+
     document_metadata = metadata.get("document_metadata", {})
 
     if not isinstance(document_metadata, dict):
         document_metadata = {}
+
+    source_type = (
+        file_format.lower()
+        if isinstance(file_format, str)
+        else "unknown"
+    )
 
     normalized_records = []
 
@@ -160,7 +106,6 @@ def build_normalized_records(ingestion_result, known_names=None):
             continue
 
         locator = item.get("locator", f"record:{index}")
-
         record_id = f"REC_{len(normalized_records) + 1:03d}"
 
         hospital = get_hospital_information(
@@ -169,14 +114,10 @@ def build_normalized_records(ingestion_result, known_names=None):
             records
         )
 
+        # Use the dedicated extractor for identity candidates.
         candidates = extract_identity_candidates(data)
 
-        source_type = (
-            file_format.lower()
-            if isinstance(file_format, str)
-            else "unknown"
-        )
-
+        # Detect PII in the actual record.
         detections = detect_pii(
             data,
             source_type=source_type,
@@ -186,6 +127,19 @@ def build_normalized_records(ingestion_result, known_names=None):
             source_file=source_file
         )
 
+        # Document metadata can also contain patient information.
+        metadata_detections = detect_pii(
+            document_metadata,
+            source_type=source_type,
+            base_path="metadata.document_metadata",
+            known_names=known_names,
+            record_id=record_id,
+            source_file=source_file
+        )
+
+        detections.extend(metadata_detections)
+
+        # File and directory names can contain patient information.
         if isinstance(source_file, str) and source_file:
             filename_detections = detect_filename_pii(
                 source_file,

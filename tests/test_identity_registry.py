@@ -1,6 +1,8 @@
 
 import json
 import os
+import hmac
+import hashlib
 import tempfile
 import unittest
 
@@ -139,10 +141,66 @@ class IdentityRegistryTests(unittest.TestCase):
             self.registry.find_identity([first_identifier])
         )
 
-    def test_missing_registry_secret_is_rejected(self):
+    def test_missing_raksha_secret_is_rejected(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
                 IdentityRegistry(path=self.registry_path)
+
+    def test_registry_key_is_derived_from_raksha_secret(self):
+        master_secret = "test-master-secret"
+
+        expected_key = hmac.new(
+            master_secret.encode("utf-8"),
+            b"RAKSHA:IDENTITY-REGISTRY-KEY:v1",
+            hashlib.sha256
+        ).digest()
+
+        with patch.dict(
+            os.environ,
+            {"RAKSHA_SECRET": master_secret},
+            clear=True
+        ):
+            env_registry = IdentityRegistry(
+                path=self.registry_path
+            )
+
+        explicit_registry = IdentityRegistry(
+            path=self.registry_path,
+            secret=expected_key
+        )
+
+        identifier = ("hosp_a", "uhid", "patient-001")
+
+        self.assertEqual(
+            env_registry.fingerprint_identifier(identifier),
+            explicit_registry.fingerprint_identifier(identifier)
+        )
+
+    def test_different_raksha_secrets_produce_different_registry_keys(self):
+        identifier = ("hosp_a", "uhid", "patient-001")
+
+        with patch.dict(
+            os.environ,
+            {"RAKSHA_SECRET": "first-secret"},
+            clear=True
+        ):
+            first_registry = IdentityRegistry(
+                path=self.registry_path
+            )
+
+        with patch.dict(
+            os.environ,
+            {"RAKSHA_SECRET": "second-secret"},
+            clear=True
+        ):
+            second_registry = IdentityRegistry(
+                path=self.registry_path
+            )
+
+        self.assertNotEqual(
+            first_registry.fingerprint_identifier(identifier),
+            second_registry.fingerprint_identifier(identifier)
+        )
 
     def test_corrupted_registry_is_rejected(self):
         self.registry_path.write_text(
