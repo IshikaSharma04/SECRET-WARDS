@@ -259,6 +259,86 @@ class TestPIIDetection(unittest.TestCase):
             text[detection["start"]:detection["end"]],
             "HOSP12345"
         )
+        def test_whatsapp_report_patient_name(self):
+        text = (
+            "Report of Rahul Sharma behenji 24 Y / F\n"
+            "CBC: Hb 11.2 g/dL\n"
+            "Take medicine twice daily"
+        )
+
+        results = detect_pii(text)
+
+        patient_detection = next(
+            item for item in results
+            if item["category"] == "PATIENT_NAME"
+        )
+
+        detected_text = text[
+            patient_detection["start"]:patient_detection["end"]
+        ]
+
+        self.assertEqual(detected_text, "Rahul Sharma")
+        self.assertEqual(
+            patient_detection["method"],
+            "whatsapp_report_rule"
+        )
+
+    def test_whatsapp_split_phone_number(self):
+        text = "Koi problem ho to call karo 98765 43210"
+
+        results = detect_pii(text)
+
+        phone_detection = next(
+            item for item in results
+            if item["category"] == "PHONE"
+        )
+
+        detected_text = text[
+            phone_detection["start"]:phone_detection["end"]
+        ]
+
+        self.assertEqual(detected_text, "98765 43210")
+
+    def test_whatsapp_report_preserves_clinical_information(self):
+        text = (
+            "Report of Rahul Sharma behenji 24 Y / F\n"
+            "CBC: Hb 11.2 g/dL\n"
+            "Diagnosis: Fever\n"
+            "Take Paracetamol 500 mg twice daily"
+        )
+
+        results = detect_pii(text)
+
+        detected_values = [
+            text[item["start"]:item["end"]]
+            for item in results
+        ]
+
+        self.assertIn("Rahul Sharma", detected_values)
+        self.assertNotIn("24 Y / F", detected_values)
+        self.assertNotIn("11.2", detected_values)
+        self.assertNotIn("Fever", detected_values)
+        self.assertNotIn("Paracetamol 500 mg twice daily", detected_values)
+
+    def test_whatsapp_sender_is_not_automatically_patient(self):
+        text = (
+            "WhatsApp sender: Clinic Admin\n"
+            "Koi problem ho to call karo 98765 43210"
+        )
+
+        results = detect_pii(text)
+
+        self.assertFalse(any(
+            item["category"] == "PATIENT_NAME"
+            for item in results
+        ))
+
+        self.assertTrue(any(
+            item["category"] == "PHONE"
+            for item in results
+        ))
+
+     
 
 
 
